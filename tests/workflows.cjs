@@ -1,0 +1,55 @@
+const assert=require('node:assert/strict');
+const {webcrypto}=require('node:crypto');global.crypto=webcrypto;
+const {BrowserTeamService,fresh}=require('../data.js');
+class MemoryStore{constructor(){this.value=fresh();this.queue=Promise.resolve();}change(fn){const operation=this.queue.then(()=>{const copy=structuredClone(this.value),result=fn(copy);this.value=copy;return structuredClone(result)});this.queue=operation.catch(()=>{});return operation}}
+class Session{constructor(){this.data={}}getItem(k){return this.data[k]||null}setItem(k,v){this.data[k]=v}removeItem(k){delete this.data[k]}}
+(async()=>{
+ const store=new MemoryStore(),manager=new BrowserTeamService(store,new Session()),member=new BrowserTeamService(store,new Session()),other=new BrowserTeamService(store,new Session()),guest=new BrowserTeamService(store,new Session());
+ const call=(c,path,p)=>c.request(path,p);
+ assert.equal((await call(manager,'session')).setup,true);
+ await assert.rejects(()=>call(guest,'state'),/sign in/);
+ const first=await call(manager,'setup',{name:'Manager','email':'manager@example.com',password:'manager-password-123'});
+ await assert.rejects(()=>call(guest,'setup',{name:'Bad','email':'bad@example.com',password:'bad-password-123'}),/already configured/);
+ await call(manager,'users',{action:'create',name:'Member',email:'member@example.com',password:'member-password-123',role:'member'});
+ await call(manager,'users',{action:'create',name:'Other Member',email:'other@example.com',password:'other-password-123',role:'member'});
+ await assert.rejects(()=>call(member,'login',{email:'member@example.com',password:'incorrect'}),/incorrect/);
+ await call(member,'login',{email:'member@example.com',password:'member-password-123'});
+ await call(other,'login',{email:'other@example.com',password:'other-password-123'});
+ const st=await call(manager,'state'),uid=st.users.find(u=>u.email==='member@example.com').id;
+ assert.equal(st.task.length,0);assert.equal(st.followup.length,0);assert.equal(st.channel[0].title,'General');assert.ok(st.users.every(u=>!('password'in u)));
+ const task=await call(manager,'save',{kind:'task',title:'Prepare update',description:'Customer next steps',assignee:uid,due:'2026-10-17',status:'To do',priority:'High'});
+ assert.equal((await call(member,'state')).notification.length,1);
+ await call(member,'save',{...task,kind:'task',status:'In progress'});
+ await assert.rejects(()=>call(member,'delete',{id:task.id}),/Permission/);
+ await assert.rejects(()=>call(other,'save',{...task,kind:'task',title:'Unauthorized edit'}),/Permission/);
+ await assert.rejects(()=>call(member,'save',{kind:'announcement',title:'Blocked',description:'Member publish'}),/managers/);
+ const ann=await call(manager,'save',{kind:'announcement',title:'New update',description:'Please read the team update.'});
+ await call(member,'ack',{id:ann.id});assert.ok((await call(manager,'state')).announcement[0].acks.includes(uid));
+ await call(manager,'save',{...ann,kind:'announcement',description:'Revised update'});assert.equal((await call(manager,'state')).announcement[0].acks.length,0);
+ const follow=await call(member,'save',{kind:'followup',title:'Client One',phone:'+15555550123',assignee:uid,due:'2026-10-18',reason:'Proposal discussion',status:'Awaiting call'});
+ await call(member,'save',{...follow,kind:'followup',status:'Left voicemail',due:'2026-10-19'});
+ const note=await call(member,'save',{kind:'comment',parent:follow.id,text:'@manager@example.com Called client and left a message.'});
+ const data=Buffer.from('Follow-up attachment').toString('base64');
+ await call(member,'upload',{parent:note.id,name:'notes.txt',data});
+ const after=await call(manager,'state');assert.equal(after.comment.filter(x=>x.parent===follow.id).length,2);
+ const file=after.files[0];assert.ok(!('data'in file));assert.equal((await call(manager,'download',{id:file.id})).data,data);
+ await assert.rejects(()=>call(guest,'download',{id:file.id}),/sign in/);
+ const channel=await call(member,'save',{kind:'channel',title:'Operations'});
+ const message=await call(member,'save',{kind:'message',channel:channel.id,text:'@manager@example.com Review the handoff.'});
+ await call(member,'upload',{parent:message.id,name:'handoff.txt',data});
+ assert.ok((await call(manager,'state')).notification.some(n=>n.title==='You were mentioned'&&n.target==='chat/'+channel.id));
+ assert.ok((await call(other,'state')).channel.some(c=>c.id===channel.id));
+ await call(manager,'read',{});assert.ok((await call(manager,'state')).notification.every(n=>n.read));
+ const event=await call(member,'save',{kind:'event',title:'Team check-in',description:'Plan tomorrow',date:'2026-10-19',time:'09:30'});
+ await call(member,'save',{...event,kind:'event',time:'10:00'});assert.equal((await call(manager,'state')).event[0].time,'10:00');
+ await assert.rejects(()=>call(other,'save',{...event,kind:'event',title:'Blocked edit'}),/Permission/);
+ await assert.rejects(()=>call(member,'users',{action:'update',id:uid,role:'manager',active:true}),/Permission/);
+ await call(manager,'users',{action:'update',id:uid,role:'member',active:false});await assert.rejects(()=>call(member,'state'),/sign in/);
+ await call(manager,'users',{action:'update',id:uid,role:'manager',active:true});assert.equal((await call(member,'state')).users.find(u=>u.id===uid).role,'manager');
+ // Browser-local role updates are effective on each service call.
+ await call(member,'save',{kind:'announcement',title:'Manager now',description:'Role change works'});
+ await call(manager,'delete',{id:follow.id});const end=await call(manager,'state');assert.ok(!end.comment.some(c=>c.parent===follow.id));assert.ok(!end.files.some(f=>f.id===file.id));
+ const reloaded=new BrowserTeamService(store,manager.session);assert.equal((await call(reloaded,'state')).task[0].title,'Prepare update');
+ await call(manager,'logout');assert.equal((await call(manager,'session')).user,null);
+ console.log('PASS: setup/login/logout, accounts/roles, task permissions, assignments, announcements/acks, call history, file upload/download, channel visibility, mentions, notification links/read state, events, deactivation, cleanup, persistence.');
+})().catch(e=>{console.error(e);process.exitCode=1});
