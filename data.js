@@ -43,6 +43,17 @@ class BrowserTeamService{
   }
   const result=await this.store.change(d=>{
    const uid=this.session.getItem('sh-team-session');const user=d.users.find(u=>u.id===uid&&u.active);
+   if(path==='external-session'){
+    check(typeof p.id==='string'&&/^[0-9a-f-]{36}$/i.test(p.id),'Invalid identity',400);
+    check(typeof p.email==='string'&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email),'Invalid email',400);
+    let account=d.users.find(u=>u.id===p.id);
+    if(!account){
+      account={id:p.id,name:String(p.name||p.email.split('@')[0]).slice(0,120),email:p.email.trim().toLowerCase(),role:'member',active:true,external:true};
+      d.users.push(account);
+    }
+    check(account.active,'Team account is inactive',403);
+    return {user:publicUser(account),signIn:account.id};
+   }
    if(path==='session')return {setup:d.users.length===0,user:user?publicUser(user):null};
    if(path==='setup'){
     check(d.users.length===0,'Workspace already configured',400);
